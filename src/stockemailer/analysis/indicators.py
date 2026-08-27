@@ -154,4 +154,37 @@ def calculate_extended_indicators(df: pd.DataFrame) -> pd.DataFrame:
         window=10,
     ).roc()
 
+        # --- Trend persistence signals ---
+
+    def _rolling_slope(series: pd.Series, window: int) -> pd.Series:
+        """Linear-regression slope of `series` over a rolling window."""
+        return series.rolling(window).apply(
+            lambda values: np.polyfit(
+                np.arange(len(values)),
+                values,
+                1,
+            )[0],
+            raw=True,
+        )
+
+    # Normalized (%-per-day) slope of price itself: a real trend-strength
+    # number rather than a boolean "is Close above SMA_20 today" check.
+    close_slope_10d = _rolling_slope(close, 10)
+    df["CLOSE_SLOPE_10D"] = (close_slope_10d / close) * 100
+
+    # Is the moving average itself rising, not just "is price above it"?
+    sma20_slope = _rolling_slope(df["SMA_20"], 5)
+    df["SMA_20_SLOPE"] = (sma20_slope / df["SMA_20"]) * 100
+
+    # Consistency: fraction of the last 10 sessions that closed up.
+    up_day = (df["RETURN_1D"] > 0).astype(float)
+    df["UP_DAY_RATIO_10D"] = up_day.rolling(10).mean()
+
+    # How established is the trend — consecutive days above SMA_50,
+    # reset to 0 whenever price drops below it.
+    above_sma50 = (close > df["SMA_50"]).astype(int)
+    run_id = (above_sma50 != above_sma50.shift()).cumsum()
+    days_above = above_sma50.groupby(run_id).cumcount() + 1
+    df["DAYS_ABOVE_SMA_50"] = days_above.where(above_sma50 == 1, 0)
+
     return df

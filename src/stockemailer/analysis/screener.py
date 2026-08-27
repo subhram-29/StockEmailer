@@ -17,29 +17,73 @@ def _rounded_or_none(value: object, decimals: int) -> float | None:
     return round(float(value), decimals)
 
 
+# EXTENDED_SCORE_COLUMNS = (
+#     "ATR_14", "BOLL_UPPER", "BOLL_MIDDLE", "BOLL_LOWER", "BOLL_WIDTH",
+#     "ADX_14", "PLUS_DI", "MINUS_DI", "STOCH_K", "STOCH_D", "CCI_20",
+#     "WILLIAMS_R", "OBV", "OBV_SLOPE_5", "VWAP_20", "ROC_10",
+#     "BULLISH_ENGULFING", "BEARISH_ENGULFING", "HAMMER", "SHOOTING_STAR",
+#     "DOJI", "THREE_WHITE_SOLDIERS", "GOLDEN_CROSS", "DEATH_CROSS",
+# )
 EXTENDED_SCORE_COLUMNS = (
     "ATR_14", "BOLL_UPPER", "BOLL_MIDDLE", "BOLL_LOWER", "BOLL_WIDTH",
     "ADX_14", "PLUS_DI", "MINUS_DI", "STOCH_K", "STOCH_D", "CCI_20",
     "WILLIAMS_R", "OBV", "OBV_SLOPE_5", "VWAP_20", "ROC_10",
     "BULLISH_ENGULFING", "BEARISH_ENGULFING", "HAMMER", "SHOOTING_STAR",
     "DOJI", "THREE_WHITE_SOLDIERS", "GOLDEN_CROSS", "DEATH_CROSS",
+    "CLOSE_SLOPE_10D", "SMA_20_SLOPE", "UP_DAY_RATIO_10D",
+    "DAYS_ABOVE_SMA_50",
 )
+
+
+def _trend_regime_multiplier(row: pd.Series) -> float:
+    """
+    Classify direction + strength from ADX/+DI/-DI and return a multiplier.
+
+    ADX alone measures trend *strength*, not direction — it will be high
+    in a strong downtrend too. This function is what was missing: it uses
+    +DI/-DI to confirm the trend is actually bullish before letting ADX
+    strength boost the score, and heavily discounts (rather than ignores)
+    a confirmed downtrend regardless of what other signals say.
+    """
+    adx = row["ADX_14"]
+    plus_di = row["PLUS_DI"]
+    minus_di = row["MINUS_DI"]
+
+    if pd.isna(adx) or pd.isna(plus_di) or pd.isna(minus_di):
+        return 1.0  # insufficient data: no adjustment, fall back to raw score
+
+    bullish_direction = plus_di > minus_di
+
+    if bullish_direction and adx >= 25:
+        return 1.2   # strong, confirmed uptrend
+    if bullish_direction and adx >= 15:
+        return 1.0   # moderate, confirmed uptrend
+    if bullish_direction:
+        return 0.7   # direction is up but trend isn't established yet
+    if adx >= 20:
+        return 0.1   # confirmed downtrend — score should not read as momentum
+    return 0.6        # direction is down but weak/noisy, not a clean signal
 
 
 def calculate_momentum_score(row: pd.Series) -> float:
     """
-    Calculate a deterministic momentum score using all available signals.
+    Deterministic momentum score weighted toward sustained trend behavior.
 
-    Legacy signals contribute up to 9 points and retained extended
-    confirmation signals contribute up to 8 additional points before
-    bearish-pattern deductions.
+    Structure:
+      1. Trend persistence (0-3): does history show a real, ongoing trend?
+      2. Momentum trigger (0-5): is something happening right now?
+         Correlated "price above short-term average" signals are
+         consolidated into one confirmation ratio instead of each
+         scoring separately, to avoid rewarding the same fact six times.
+      3. Pattern confirmation (bounded add/subtract).
+      4. Everything above is scaled by a trend-direction/strength
+         multiplier derived from ADX + DI, so a strong signal riding a
+         confirmed downtrend gets suppressed rather than scored high.
     """
-
     score = 0.0
 
-    # 2-day return
+    # --- Legacy short-term acceleration signals (kept: distinct info) ---
     return_2d = row["RETURN_2D"]
-
     if return_2d >= 5:
         score += 3
     elif return_2d >= 3:
@@ -47,9 +91,7 @@ def calculate_momentum_score(row: pd.Series) -> float:
     elif return_2d >= 1:
         score += 1
 
-    # Volume confirmation
     volume_ratio = row["VOLUME_RATIO"]
-
     if volume_ratio >= 2:
         score += 2
     elif volume_ratio >= 1.5:
@@ -57,105 +99,208 @@ def calculate_momentum_score(row: pd.Series) -> float:
     elif volume_ratio >= 1.2:
         score += 1
 
-    # RSI
     rsi = row["RSI"]
-
     if 55 <= rsi <= 70:
         score += 1
+    elif rsi > 80:
+        score -= 0.5  # overextended: exhaustion risk, not fresh momentum
 
-    # Moving-average trend
-    if (
-        row["Close"] > row["SMA_20"]
-        and row["SMA_20"] > row["SMA_50"]
-    ):
-        score += 1
-
-    # MACD
-    if row["MACD"] > row["MACD_SIGNAL"]:
-        score += 1
-
-    # 5-day momentum
     if row["RETURN_5D"] > 0:
         score += 1
 
-    extended_columns = {
-        "ATR_14",
-        "BOLL_UPPER",
-        "BOLL_MIDDLE",
-        "BOLL_LOWER",
-        "BOLL_WIDTH",
-        "ADX_14",
-        "PLUS_DI",
-        "MINUS_DI",
-        "STOCH_K",
-        "STOCH_D",
-        "CCI_20",
-        "WILLIAMS_R",
-        "OBV",
-        "OBV_SLOPE_5",
-        "VWAP_20",
-        "ROC_10",
-        "BULLISH_ENGULFING",
-        "BEARISH_ENGULFING",
-        "HAMMER",
-        "SHOOTING_STAR",
-        "DOJI",
-        "THREE_WHITE_SOLDIERS",
-        "GOLDEN_CROSS",
-        "DEATH_CROSS",
-    }
-    if not extended_columns.issubset(row.index):
+    if not set(EXTENDED_SCORE_COLUMNS).issubset(row.index):
         return round(score, 2)
 
-    # Extended volatility and trend confirmation.
-    extended_score = 0.0
+    # --- Trend persistence (uses history, not just today) ---
+    persistence = 0.0
+    up_ratio = row["UP_DAY_RATIO_10D"]
+    if pd.notna(up_ratio):
+        if up_ratio >= 0.7:
+            persistence += 1.5
+        elif up_ratio >= 0.5:
+            persistence += 1.0
 
+    close_slope = row["CLOSE_SLOPE_10D"]
+    if pd.notna(close_slope):
+        if close_slope > 0.3:
+            persistence += 1.0
+        elif close_slope > 0.1:
+            persistence += 0.5
+
+    sma_slope = row["SMA_20_SLOPE"]
+    if pd.notna(sma_slope) and sma_slope > 0:
+        persistence += 0.5
+
+    score += persistence
+
+    # --- Momentum trigger: consolidated confirmation ratio, not 6 flat adds ---
+    confirmations = [
+        row["Close"] > row["SMA_20"] > row["SMA_50"],
+        row["MACD"] > row["MACD_SIGNAL"],
+        row["STOCH_K"] > row["STOCH_D"],
+        row["Close"] > row["VWAP_20"],
+        row["Close"] > row["BOLL_MIDDLE"],
+    ]
+    confirmation_ratio = sum(bool(c) for c in confirmations) / len(confirmations)
+    score += confirmation_ratio * 2.0  # capped at 2 points total, was ~5 before
+
+    # --- Volatility/quality context (unchanged reasoning) ---
     if row["ATR_14"] / row["Close"] <= 0.03:
-        extended_score += 0.5
+        score += 0.5
     if row["BOLL_WIDTH"] <= 10:
-        extended_score += 0.5
-    if row["Close"] > row["BOLL_MIDDLE"]:
-        extended_score += 0.5
-    if row["Close"] > row["BOLL_LOWER"]:
-        extended_score += 0.5
-    if row["Close"] < row["BOLL_UPPER"]:
-        extended_score += 0.5
-    if row["ADX_14"] >= 20:
-        extended_score += 0.5
-    # Extended oscillator and volume confirmation. RSI remains the representative
-    # oscillator in the legacy score; correlated CCI, Williams %R, ROC, and DI
-    # signals remain available for reporting but do not add duplicate points.
-    if row["STOCH_K"] > row["STOCH_D"]:
-        extended_score += 0.5
-    if row["OBV"] > 0:
-        extended_score += 0.5
-    if row["OBV_SLOPE_5"] > 0:
-        extended_score += 0.5
-    if row["Close"] > row["VWAP_20"]:
-        extended_score += 0.5
+        score += 0.5
 
-    # Bullish patterns add confirmation; bearish patterns subtract it.
+    # --- Pattern confirmation (unchanged) ---
     for pattern_name in (
-        "BULLISH_ENGULFING",
-        "HAMMER",
-        "THREE_WHITE_SOLDIERS",
-        "GOLDEN_CROSS",
+        "BULLISH_ENGULFING", "HAMMER", "THREE_WHITE_SOLDIERS", "GOLDEN_CROSS",
     ):
         if row[pattern_name]:
-            extended_score += 0.75
-
+            score += 0.75
     for pattern_name in (
-        "BEARISH_ENGULFING",
-        "SHOOTING_STAR",
-        "DEATH_CROSS",
+        "BEARISH_ENGULFING", "SHOOTING_STAR", "DEATH_CROSS",
     ):
         if row[pattern_name]:
-            extended_score -= 0.5
-
+            score -= 0.5
     if row["DOJI"]:
-        extended_score -= 0.25
+        score -= 0.25
 
-    return round(score + extended_score, 2)
+    # --- Direction/strength gate applied last ---
+    score *= _trend_regime_multiplier(row)
+
+    return round(score, 2)
+
+
+
+# def calculate_momentum_score(row: pd.Series) -> float:
+#     """
+#     Calculate a deterministic momentum score using all available signals.
+
+#     Legacy signals contribute up to 9 points and retained extended
+#     confirmation signals contribute up to 8 additional points before
+#     bearish-pattern deductions.
+#     """
+
+#     score = 0.0
+
+#     # 2-day return
+#     return_2d = row["RETURN_2D"]
+
+#     if return_2d >= 5:
+#         score += 3
+#     elif return_2d >= 3:
+#         score += 2
+#     elif return_2d >= 1:
+#         score += 1
+
+#     # Volume confirmation
+#     volume_ratio = row["VOLUME_RATIO"]
+
+#     if volume_ratio >= 2:
+#         score += 2
+#     elif volume_ratio >= 1.5:
+#         score += 1.5
+#     elif volume_ratio >= 1.2:
+#         score += 1
+
+#     # RSI
+#     rsi = row["RSI"]
+
+#     if 55 <= rsi <= 70:
+#         score += 1
+
+#     # Moving-average trend
+#     if (
+#         row["Close"] > row["SMA_20"]
+#         and row["SMA_20"] > row["SMA_50"]
+#     ):
+#         score += 1
+
+#     # MACD
+#     if row["MACD"] > row["MACD_SIGNAL"]:
+#         score += 1
+
+#     # 5-day momentum
+#     if row["RETURN_5D"] > 0:
+#         score += 1
+
+#     extended_columns = {
+#         "ATR_14",
+#         "BOLL_UPPER",
+#         "BOLL_MIDDLE",
+#         "BOLL_LOWER",
+#         "BOLL_WIDTH",
+#         "ADX_14",
+#         "PLUS_DI",
+#         "MINUS_DI",
+#         "STOCH_K",
+#         "STOCH_D",
+#         "CCI_20",
+#         "WILLIAMS_R",
+#         "OBV",
+#         "OBV_SLOPE_5",
+#         "VWAP_20",
+#         "ROC_10",
+#         "BULLISH_ENGULFING",
+#         "BEARISH_ENGULFING",
+#         "HAMMER",
+#         "SHOOTING_STAR",
+#         "DOJI",
+#         "THREE_WHITE_SOLDIERS",
+#         "GOLDEN_CROSS",
+#         "DEATH_CROSS",
+#     }
+#     if not extended_columns.issubset(row.index):
+#         return round(score, 2)
+
+#     # Extended volatility and trend confirmation.
+#     extended_score = 0.0
+
+#     if row["ATR_14"] / row["Close"] <= 0.03:
+#         extended_score += 0.5
+#     if row["BOLL_WIDTH"] <= 10:
+#         extended_score += 0.5
+#     if row["Close"] > row["BOLL_MIDDLE"]:
+#         extended_score += 0.5
+#     if row["Close"] > row["BOLL_LOWER"]:
+#         extended_score += 0.5
+#     if row["Close"] < row["BOLL_UPPER"]:
+#         extended_score += 0.5
+#     if row["ADX_14"] >= 20:
+#         extended_score += 0.5
+#     # Extended oscillator and volume confirmation. RSI remains the representative
+#     # oscillator in the legacy score; correlated CCI, Williams %R, ROC, and DI
+#     # signals remain available for reporting but do not add duplicate points.
+#     if row["STOCH_K"] > row["STOCH_D"]:
+#         extended_score += 0.5
+#     if row["OBV"] > 0:
+#         extended_score += 0.5
+#     if row["OBV_SLOPE_5"] > 0:
+#         extended_score += 0.5
+#     if row["Close"] > row["VWAP_20"]:
+#         extended_score += 0.5
+
+#     # Bullish patterns add confirmation; bearish patterns subtract it.
+#     for pattern_name in (
+#         "BULLISH_ENGULFING",
+#         "HAMMER",
+#         "THREE_WHITE_SOLDIERS",
+#         "GOLDEN_CROSS",
+#     ):
+#         if row[pattern_name]:
+#             extended_score += 0.75
+
+#     for pattern_name in (
+#         "BEARISH_ENGULFING",
+#         "SHOOTING_STAR",
+#         "DEATH_CROSS",
+#     ):
+#         if row[pattern_name]:
+#             extended_score -= 0.5
+
+#     if row["DOJI"]:
+#         extended_score -= 0.25
+
+#     return round(score + extended_score, 2)
 
 
 def calculate_score_components(row: pd.Series) -> dict[str, float]:
